@@ -38,10 +38,12 @@ const server = app.listen(PORT, "0.0.0.0", () => {
 
 manager.startAll()
   .then(() => {
+    manager.startPolling(60000);
     console.log("[APEX] Multi-Bot Worker startup completed.");
   })
   .catch(error => {
     console.error("[APEX] Worker startup failed:", error);
+    manager.startPolling(60000);
   });
 
 let shuttingDown = false;
