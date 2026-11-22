@@ -2,7 +2,7 @@ import "dotenv/config";
 
 import express from "express";
 import { prisma } from "./db.js";
-import { adminRoutes } from "./dashboard/admin.routes.js";
+import adminRoutes from "./dashboard/admin.routes.js";
 import { ClientManager } from "./bot/clientManager.js";
 
 const app = express();
