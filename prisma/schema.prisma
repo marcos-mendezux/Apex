@@ -1,0 +1,115 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum LicenseStatus {
+  ACTIVE
+  SUSPENDED
+  REVOKED
+}
+
+enum CredentialStatus {
+  ACTIVE
+  INVALID
+  DISABLED
+}
+
+enum IncidentSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+model BotCredential {
+  id            String           @id @default(cuid())
+  applicationId String           @unique
+  ciphertext    String
+  iv            String
+  authTag       String
+  keyVersion    Int              @default(1)
+  status        CredentialStatus @default(ACTIVE)
+
+  licenses      GuildLicense[]
+
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+}
+
+model GuildLicense {
+  id           String        @id @default(cuid())
+  guildId      String        @unique
+  ownerId      String
+  status       LicenseStatus @default(ACTIVE)
+
+  credentialId String?
+  credential   BotCredential? @relation(
+    fields: [credentialId],
+    references: [id],
+    onDelete: SetNull
+  )
+
+  securityConfig SecurityConfig?
+  incidents      SecurityIncident[]
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([status])
+  @@index([ownerId])
+}
+
+model SecurityConfig {
+  id                 String @id @default(cuid())
+  licenseId          String @unique
+  license            GuildLicense @relation(
+    fields: [licenseId],
+    references: [id],
+    onDelete: Cascade
+  )
+
+  enabled            Boolean @default(true)
+
+  channelDeleteLimit Int @default(3)
+  channelCreateLimit Int @default(8)
+  banLimit           Int @default(5)
+  kickLimit          Int @default(5)
+  dangerousRoleLimit Int @default(3)
+
+  windowSeconds      Int @default(10)
+
+  trustedUserIds     String[] @default([])
+  protectedRoleIds   String[] @default([])
+
+  stripStaffEnabled  Boolean @default(true)
+  inviteLockEnabled  Boolean @default(true)
+
+  updatedAt          DateTime @updatedAt
+}
+
+model SecurityIncident {
+  id          String @id @default(cuid())
+  licenseId   String
+  license     GuildLicense @relation(
+    fields: [licenseId],
+    references: [id],
+    onDelete: Cascade
+  )
+
+  eventType   String
+  executorId  String?
+  targetId    String?
+  severity    IncidentSeverity
+  actionTaken String?
+  details     Json
+
+  createdAt   DateTime @default(now())
+
+  @@index([licenseId, createdAt])
+  @@index([executorId, createdAt])
+}
