@@ -48,11 +48,7 @@ model GuildLicense {
   status       LicenseStatus @default(ACTIVE)
 
   credentialId String?
-  credential   BotCredential? @relation(
-    fields: [credentialId],
-    references: [id],
-    onDelete: SetNull
-  )
+  credential   BotCredential? @relation(fields: [credentialId], references: [id], onDelete: SetNull)
 
   securityConfig SecurityConfig?
   incidents      SecurityIncident[]
@@ -67,11 +63,7 @@ model GuildLicense {
 model SecurityConfig {
   id                 String @id @default(cuid())
   licenseId          String @unique
-  license            GuildLicense @relation(
-    fields: [licenseId],
-    references: [id],
-    onDelete: Cascade
-  )
+  license            GuildLicense @relation(fields: [licenseId], references: [id], onDelete: Cascade)
 
   enabled            Boolean @default(true)
 
@@ -95,11 +87,7 @@ model SecurityConfig {
 model SecurityIncident {
   id          String @id @default(cuid())
   licenseId   String
-  license     GuildLicense @relation(
-    fields: [licenseId],
-    references: [id],
-    onDelete: Cascade
-  )
+  license     GuildLicense @relation(fields: [licenseId], references: [id], onDelete: Cascade)
 
   eventType   String
   executorId  String?
