@@ -8,25 +8,101 @@ import { prisma } from "../db.js";
 import { decryptToken } from "../security/tokenCrypto.js";
 import { authorizeGuild } from "./authorization.js";
 
+const REGISTRATION_GRACE_MS = 5 * 60 * 1000;
+
 export class ClientManager {
   constructor() {
     this.clients = new Map();
     this.starting = new Set();
+    this.pendingGuilds = new Map();
     this.stopping = false;
     this.refreshTimer = null;
     this.refreshing = false;
+  }
+
+  pendingKey(credentialId, guildId) {
+    return `${credentialId}:${guildId}`;
+  }
+
+  async handleGuild(guild, credentialId) {
+    const key = this.pendingKey(credentialId, guild.id);
+
+    let license;
+
+    try {
+      license = await prisma.guildLicense.findUnique({
+        where: { guildId: guild.id },
+        select: {
+          id: true,
+          status: true,
+          credentialId: true
+        }
+      });
+    } catch (error) {
+      console.error(
+        `[AUTH] Could not check license for ${guild.id}:`,
+        error.message
+      );
+      return;
+    }
+
+    // A server without a license gets five minutes to register.
+    if (!license) {
+      let joinedAt = this.pendingGuilds.get(key);
+
+      if (!joinedAt) {
+        joinedAt = Date.now();
+        this.pendingGuilds.set(key, joinedAt);
+
+        console.log(
+          `[AUTH] Server ${guild.id} is awaiting registration.`
+        );
+      }
+
+      const elapsed = Date.now() - joinedAt;
+
+      if (elapsed < REGISTRATION_GRACE_MS) {
+        return;
+      }
+
+      console.warn(
+        `[AUTH] Registration period expired for ${guild.id}. Leaving.`
+      );
+
+      try {
+        await guild.leave();
+      } catch (error) {
+        console.error(
+          `[AUTH] Could not leave ${guild.id}:`,
+          error.message
+        );
+      }
+
+      this.pendingGuilds.delete(key);
+      return;
+    }
+
+    // A license exists, so normal authorization applies immediately.
+    this.pendingGuilds.delete(key);
+    await this.checkGuild(guild, credentialId);
   }
 
   async checkGuild(guild, credentialId) {
     try {
       await authorizeGuild(guild, credentialId);
     } catch (error) {
-      console.error(`[AUTH] Guild check failed for ${guild.id}:`, error.message);
+      console.error(
+        `[AUTH] Guild check failed for ${guild.id}:`,
+        error.message
+      );
 
       try {
         await guild.leave();
       } catch (leaveError) {
-        console.error("[AUTH] Leave failed:", leaveError.message);
+        console.error(
+          "[AUTH] Leave failed:",
+          leaveError.message
+        );
       }
     }
   }
@@ -45,24 +121,40 @@ export class ClientManager {
 
       for (const guild of readyClient.guilds.cache.values()) {
         if (this.stopping) break;
-        await this.checkGuild(guild, credentialId);
+        await this.handleGuild(guild, credentialId);
       }
     });
 
     client.on(Events.GuildCreate, guild => {
-      void this.checkGuild(guild, credentialId);
+      const key = this.pendingKey(credentialId, guild.id);
+
+      if (!this.pendingGuilds.has(key)) {
+        this.pendingGuilds.set(key, Date.now());
+      }
+
+      console.log(
+        `[AUTH] New server detected: ${guild.id}. Registration grace period started.`
+      );
+
+      void this.handleGuild(guild, credentialId);
     });
 
     client.on(Events.GuildUpdate, (_oldGuild, newGuild) => {
-      void this.checkGuild(newGuild, credentialId);
+      void this.handleGuild(newGuild, credentialId);
+    });
+
+    client.on(Events.GuildDelete, guild => {
+      this.pendingGuilds.delete(
+        this.pendingKey(credentialId, guild.id)
+      );
     });
 
     client.on("error", error => {
-      console.error(`[BOT] Client error:`, error.message);
+      console.error("[BOT] Client error:", error.message);
     });
 
     client.on("shardError", error => {
-      console.error(`[BOT] Gateway error:`, error.message);
+      console.error("[BOT] Gateway error:", error.message);
     });
 
     return client;
@@ -73,18 +165,19 @@ export class ClientManager {
       this.stopping ||
       this.clients.has(credential.id) ||
       this.starting.has(credential.id)
-    ) return;
+    ) {
+      return;
+    }
 
     this.starting.add(credential.id);
 
     let token;
     let client;
+    let timeout;
 
     try {
       token = decryptToken(credential);
       client = this.createClient(credential.id);
-
-      let timeout;
 
       const readyPromise = new Promise((resolve, reject) => {
         timeout = setTimeout(() => {
@@ -98,6 +191,7 @@ export class ClientManager {
       await readyPromise;
 
       clearTimeout(timeout);
+      timeout = null;
 
       if (this.stopping) {
         client.destroy();
@@ -105,8 +199,13 @@ export class ClientManager {
       }
 
       this.clients.set(credential.id, client);
-      console.log(`[BOT] Credential ${credential.id} started.`);
+
+      console.log(
+        `[BOT] Credential ${credential.id} started.`
+      );
     } catch (error) {
+      if (timeout) clearTimeout(timeout);
+
       console.error(
         `[BOT] Could not start credential ${credential.id}:`,
         error.message
@@ -114,8 +213,13 @@ export class ClientManager {
 
       if (error.code === "TokenInvalid") {
         await prisma.botCredential.updateMany({
-          where: { id: credential.id, status: "ACTIVE" },
-          data: { status: "INVALID" }
+          where: {
+            id: credential.id,
+            status: "ACTIVE"
+          },
+          data: {
+            status: "INVALID"
+          }
         });
       }
 
@@ -136,23 +240,51 @@ export class ClientManager {
         where: {
           status: "ACTIVE",
           licenses: {
-            some: { status: "ACTIVE" }
+            some: {
+              status: "ACTIVE"
+            }
           }
         }
       });
 
-      const activeIds = new Set(credentials.map(item => item.id));
+      const activeIds = new Set(
+        credentials.map(item => item.id)
+      );
 
-      // Disconnect credentials that are no longer authorized.
+      // Stop credentials that no longer have active licenses.
       for (const [id, client] of this.clients) {
-        if (!activeIds.has(id)) {
-          console.log(`[BOT] Stopping inactive credential ${id}.`);
-          client.destroy();
-          this.clients.delete(id);
+        if (activeIds.has(id)) continue;
+
+        console.log(
+          `[BOT] Leaving servers for inactive credential ${id}.`
+        );
+
+        for (const guild of [...client.guilds.cache.values()]) {
+          try {
+            await guild.leave();
+          } catch (error) {
+            console.error(
+              `[BOT] Could not leave ${guild.id}:`,
+              error.message
+            );
+          }
+        }
+
+        client.destroy();
+        this.clients.delete(id);
+      }
+
+      // Recheck every server for each connected bot.
+      for (const [credentialId, client] of this.clients) {
+        if (this.stopping) break;
+
+        for (const guild of [...client.guilds.cache.values()]) {
+          if (this.stopping) break;
+          await this.handleGuild(guild, credentialId);
         }
       }
 
-      // Connect newly registered credentials.
+      // Start newly registered bot credentials.
       for (const credential of credentials) {
         if (this.stopping) break;
 
@@ -168,7 +300,10 @@ export class ClientManager {
         `[APEX] Refresh complete. Active bot clients: ${this.clients.size}`
       );
     } catch (error) {
-      console.error("[APEX] Credential refresh failed:", error.message);
+      console.error(
+        "[APEX] Credential refresh failed:",
+        error.message
+      );
     } finally {
       this.refreshing = false;
     }
@@ -182,7 +317,9 @@ export class ClientManager {
   startPolling(intervalMs = 60000) {
     if (this.refreshTimer || this.stopping) return;
 
-    console.log("[APEX] Automatic credential refresh enabled (60 seconds).");
+    console.log(
+      "[APEX] Automatic credential refresh enabled (60 seconds)."
+    );
 
     this.refreshTimer = setInterval(() => {
       void this.refreshAll();
@@ -207,5 +344,6 @@ export class ClientManager {
     }
 
     this.clients.clear();
+    this.pendingGuilds.clear();
   }
 }
