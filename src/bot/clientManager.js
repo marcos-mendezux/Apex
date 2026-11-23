@@ -7,6 +7,7 @@ import {
 import { prisma } from "../db.js";
 import { decryptToken } from "../security/tokenCrypto.js";
 import { authorizeGuild } from "./authorization.js";
+import { attachModeration } from "../eye/moderation.js";
 
 const REGISTRATION_GRACE_MS = 5 * 60 * 1000;
 
@@ -46,43 +47,29 @@ export class ClientManager {
       return;
     }
 
-    // A server without a license gets five minutes to register.
     if (!license) {
       let joinedAt = this.pendingGuilds.get(key);
 
       if (!joinedAt) {
         joinedAt = Date.now();
         this.pendingGuilds.set(key, joinedAt);
-
-        console.log(
-          `[AUTH] Server ${guild.id} is awaiting registration.`
-        );
+        console.log(`[AUTH] Server ${guild.id} awaiting registration.`);
       }
 
-      const elapsed = Date.now() - joinedAt;
+      if (Date.now() - joinedAt < REGISTRATION_GRACE_MS) return;
 
-      if (elapsed < REGISTRATION_GRACE_MS) {
-        return;
-      }
-
-      console.warn(
-        `[AUTH] Registration period expired for ${guild.id}. Leaving.`
-      );
+      console.warn(`[AUTH] Registration expired for ${guild.id}.`);
 
       try {
         await guild.leave();
       } catch (error) {
-        console.error(
-          `[AUTH] Could not leave ${guild.id}:`,
-          error.message
-        );
+        console.error("[AUTH] Leave failed:", error.message);
       }
 
       this.pendingGuilds.delete(key);
       return;
     }
 
-    // A license exists, so normal authorization applies immediately.
     this.pendingGuilds.delete(key);
     await this.checkGuild(guild, credentialId);
   }
@@ -99,10 +86,7 @@ export class ClientManager {
       try {
         await guild.leave();
       } catch (leaveError) {
-        console.error(
-          "[AUTH] Leave failed:",
-          leaveError.message
-        );
+        console.error("[AUTH] Leave failed:", leaveError.message);
       }
     }
   }
@@ -112,9 +96,13 @@ export class ClientManager {
       intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMembers,
-        GatewayIntentBits.GuildModeration
+        GatewayIntentBits.GuildModeration,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent
       ]
     });
+
+    attachModeration(client);
 
     client.once(Events.ClientReady, async readyClient => {
       console.log(`[BOT] Connected: ${readyClient.user.tag}`);
@@ -133,7 +121,7 @@ export class ClientManager {
       }
 
       console.log(
-        `[AUTH] New server detected: ${guild.id}. Registration grace period started.`
+        `[AUTH] New server ${guild.id}. Registration grace period started.`
       );
 
       void this.handleGuild(guild, credentialId);
@@ -165,9 +153,7 @@ export class ClientManager {
       this.stopping ||
       this.clients.has(credential.id) ||
       this.starting.has(credential.id)
-    ) {
-      return;
-    }
+    ) return;
 
     this.starting.add(credential.id);
 
@@ -199,10 +185,7 @@ export class ClientManager {
       }
 
       this.clients.set(credential.id, client);
-
-      console.log(
-        `[BOT] Credential ${credential.id} started.`
-      );
+      console.log(`[BOT] Credential ${credential.id} started.`);
     } catch (error) {
       if (timeout) clearTimeout(timeout);
 
@@ -217,9 +200,7 @@ export class ClientManager {
             id: credential.id,
             status: "ACTIVE"
           },
-          data: {
-            status: "INVALID"
-          }
+          data: { status: "INVALID" }
         });
       }
 
@@ -240,9 +221,7 @@ export class ClientManager {
         where: {
           status: "ACTIVE",
           licenses: {
-            some: {
-              status: "ACTIVE"
-            }
+            some: { status: "ACTIVE" }
           }
         }
       });
@@ -251,13 +230,10 @@ export class ClientManager {
         credentials.map(item => item.id)
       );
 
-      // Stop credentials that no longer have active licenses.
       for (const [id, client] of this.clients) {
         if (activeIds.has(id)) continue;
 
-        console.log(
-          `[BOT] Leaving servers for inactive credential ${id}.`
-        );
+        console.log(`[BOT] Stopping inactive credential ${id}.`);
 
         for (const guild of [...client.guilds.cache.values()]) {
           try {
@@ -274,7 +250,6 @@ export class ClientManager {
         this.clients.delete(id);
       }
 
-      // Recheck every server for each connected bot.
       for (const [credentialId, client] of this.clients) {
         if (this.stopping) break;
 
@@ -284,7 +259,6 @@ export class ClientManager {
         }
       }
 
-      // Start newly registered bot credentials.
       for (const credential of credentials) {
         if (this.stopping) break;
 
@@ -317,9 +291,7 @@ export class ClientManager {
   startPolling(intervalMs = 60000) {
     if (this.refreshTimer || this.stopping) return;
 
-    console.log(
-      "[APEX] Automatic credential refresh enabled (60 seconds)."
-    );
+    console.log("[APEX] Automatic credential refresh enabled.");
 
     this.refreshTimer = setInterval(() => {
       void this.refreshAll();
